@@ -117,7 +117,7 @@ def get_matching_instancenorm(conv_op: Type[_ConvNd] = None, dimension: int = No
         return nn.InstanceNorm3d
 
 
-def get_matching_convtransp(conv_op: Type[_ConvNd] = None, dimension: int = None) -> Type[_ConvTransposeNd]:
+def get_matching_convtransp(conv_op: Type[_ConvNd] | None = None, dimension: int | None = None) -> Type[_ConvTransposeNd]:
     """
     You MUST set EITHER conv_op OR dimension. Do not set both!
 
@@ -136,6 +136,8 @@ def get_matching_convtransp(conv_op: Type[_ConvNd] = None, dimension: int = None
         return nn.ConvTranspose2d
     elif dimension == 3:
         return nn.ConvTranspose3d
+    else:
+        raise NotImplementedError
 
 
 def get_matching_batchnorm(conv_op: Type[_ConvNd] = None, dimension: int = None) -> Type[_BatchNorm]:
