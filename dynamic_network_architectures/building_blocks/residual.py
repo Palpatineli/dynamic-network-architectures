@@ -1,6 +1,6 @@
 from typing import Tuple, List, Union, Type
 import torch.nn
-from torch import nn
+from torch import Tensor, nn
 from torch.nn.modules.conv import _ConvNd
 from torch.nn.modules.dropout import _DropoutNd
 
@@ -349,6 +349,33 @@ class StackedResidualBlocks(nn.Module):
         for b in self.blocks[1:]:
             output += b.compute_conv_feature_map_size(size_after_stride)
         return output
+
+
+class BasicResBlock(nn.Module):  # As used in the OG STU-Net
+    def __init__(self, input_channel: int, output_channel: int, kernel_size: int = 3, padding: int = 1,
+                 stride: int = 1, use_1x1conv=False):
+        super().__init__()
+        self.conv1 = nn.Conv3d(input_channel, output_channel, kernel_size, stride=stride, padding=padding)
+        self.norm1 = nn.InstanceNorm3d(output_channel, affine=True)
+        self.act1 = nn.LeakyReLU(inplace=True)
+
+        self.conv2 = nn.Conv3d(output_channel, output_channel, kernel_size, padding=padding)
+        self.norm2 = nn.InstanceNorm3d(output_channel, affine=True)
+        self.act2 = nn.LeakyReLU(inplace=True)
+
+        if use_1x1conv:
+            self.conv3 = nn.Conv3d(input_channel, output_channel, kernel_size=1, stride=stride)
+        else:
+            self.conv3 = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.conv1(x)
+        y = self.act1(self.norm1(y))
+        y = self.norm2(self.conv2(y))
+        if self.conv3:
+            x = self.conv3(x)
+        y += x
+        return self.act2(y)
 
 
 if __name__ == '__main__':

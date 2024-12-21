@@ -1,7 +1,6 @@
 from typing import Literal, Sequence, Type
 import torch
 from torch import Tensor, nn
-from torch.nn.functional import layer_norm
 from dynamic_network_architectures.building_blocks.helper import convert_conv_op_to_dim, get_matching_convtransp
 
 
@@ -39,9 +38,7 @@ class MedNeXtBlock(nn.Module):
         if norm_type == "group":
             self.norm = nn.GroupNorm(num_groups=input_channels, num_channels=input_channels)
         elif norm_type == "layer":
-            self.norm = LayerNorm(
-                normalized_shape=input_channels, data_format="channels_first"
-            )
+            self.norm = LayerNormChannelFirst(normalized_shape=input_channels)
 
         # Second convolution (Expansion) layer with Conv3D 1x1x1
         self.conv2 = conv_op(
@@ -223,37 +220,15 @@ class OutBlock(nn.Module):
         return self.conv_out(x)
 
 
-class LayerNorm(nn.Module):
+class LayerNormChannelFirst(nn.LayerNorm):
     """LayerNorm that supports two data formats: channels_last (default) or channels_first.
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
     shape (batch_size, height, width, channels) while channels_first corresponds to inputs
     with shape (batch_size, channels, height, width).
     """
-
-    def __init__(
-        self,
-        normalized_shape: int | Sequence[int],
-        eps: float = 1e-5,
-        data_format: Literal["channels_first", "channels_last"] = "channels_last",
-    ):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape, device='cuda'))  # beta
-        self.bias = nn.Parameter(torch.zeros(normalized_shape, device='cuda'))  # gamma
-        self.eps = eps
-        self.data_format = data_format
-        self.normalized_shape = [normalized_shape] if isinstance(normalized_shape, int) else normalized_shape
-
-    def forward(self, x: Tensor, dummy_tensor=False):
-        del dummy_tensor
-        if self.data_format == "channels_last":
-            return layer_norm(
-                x, self.normalized_shape, self.weight, self.bias, self.eps
-            )
-        elif self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None, None] * x + self.bias[:, None, None, None]
-            return x
-        else:
-            raise NotImplementedError
+    def forward(self, input: Tensor):
+        u = input.mean(1, keepdim=True)
+        s = (input - u).pow(2).mean(1, keepdim=True)
+        input = (input - u) / torch.sqrt(s + self.eps)
+        input = self.weight[:, None, None, None] * input + self.bias[:, None, None, None]
+        return input
