@@ -1,204 +1,183 @@
-from typing import Callable, List, Literal, Sequence, Type
-import numpy as np
+"""Plan-configurable MedNeXt with nnU-Net resolution and supervision conventions."""
+from math import prod
+
 import torch
-from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint  # type: ignore
-from dynamic_network_architectures.building_blocks.mednext import MedNeXtBlock, MedNeXtUpBlock, MedNeXtDownBlock
-from dynamic_network_architectures.building_blocks.mednext import OutBlock 
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+
+from dynamic_network_architectures.architectures.abstract_arch import AbstractDynamicNetworkArchitectures
 from dynamic_network_architectures.building_blocks.helper import convert_conv_op_to_dim
+from dynamic_network_architectures.building_blocks.mednext import (
+    MedNeXtBlock, MedNeXtDownBlock, MedNeXtUpBlock, OutBlock, spatial_tuple,
+)
 
-checkpoint: Callable[[Callable, torch.Tensor, nn.Parameter], torch.Tensor] = checkpoint
+
+def stage_values(value, count, name):
+    values = [value] * count if isinstance(value, int) else list(value)
+    if len(values) != count or any(not isinstance(v, int) or v < 1 for v in values):
+        raise ValueError(f'{name} must have {count} positive integer entries')
+    return values
 
 
-class MedNeXt(nn.Module):
-    def __init__(
-        self,
-        input_channels: int,
-        n_stages: int,
-        channels: int | Sequence[int],
-        conv_op: Type[nn.Conv2d] | Type[nn.Conv3d],
-        kernel_sizes: int | Sequence[Sequence[int]],
-        strides: int | Sequence[Sequence[int]],
-        num_classes: int,
-        n_conv_per_stage: int | Sequence[int],  # Can be used to test staging ratio:
-        expansion_ratio: int | Sequence[int],  # Expansion ratio as in Swin Transformers
-        deep_supervision: bool,  # Can be used to test deep supervision
-        do_res: bool = False,  # Can be used to individually test residual connection
-        do_res_up_down: bool = False,  # Additional 'res' connection on up and down convs
-        outside_block_checkpointing: bool = False,  # Either inside block or outside block
-        # [3,3,9,3] in Swin as opposed to [2,2,2,2,2] in nnUNet
-        norm_type: Literal['group', 'layer'] = "group",
-        grn: bool = False,
-    ):
+def spatial_stages(value, count, ndim, name):
+    values = [value] * count if isinstance(value, int) else list(value)
+    if len(values) != count:
+        raise ValueError(f'{name} must have {count} entries')
+    return [spatial_tuple(v, ndim, name) for v in values]
 
+
+def run_block(block, x, enabled):
+    if enabled and block.training and torch.is_grad_enabled():
+        return checkpoint(block, x, use_reentrant=False)
+    return block(x)
+
+
+class MedNeXtEncoder(nn.Module):
+    def __init__(self, input_channels, features, conv_op, kernels, strides, counts,
+                 expansions, do_res, do_res_up_down, norm_type, grn, drop_path_rate,
+                 checkpointing):
         super().__init__()
+        self.conv_op = conv_op
+        self.output_channels = features
+        self.strides = strides
+        self.checkpointing = checkpointing
+        self.stem = conv_op(input_channels, features[0], 1)
+        self.stages = nn.ModuleList()
+        self.down_blocks = nn.ModuleList()
+        for i, channels in enumerate(features):
+            self.stages.append(nn.Sequential(*[
+                MedNeXtBlock(conv_op, channels, channels, expansions[i], kernels[i],
+                             do_res=do_res, norm_type=norm_type, grn=grn,
+                             drop_path_rate=drop_path_rate)
+                for _ in range(counts[i])]))
+            if i > 0:
+                self.down_blocks.append(MedNeXtDownBlock(
+                    conv_op, features[i - 1], channels, expansions[i], kernels[i - 1],
+                    stride=strides[i], do_res=do_res_up_down, norm_type=norm_type, grn=grn))
 
-        self.n_stages = n_stages
-        self.deep_supervision = deep_supervision
-        self.outside_block_checkpointing = outside_block_checkpointing
-
-        if isinstance(expansion_ratio, int):
-            expansion_ratio = [expansion_ratio] * (2 * n_stages + 1)
-
-
-        if isinstance(n_conv_per_stage, int):
-            n_conv_per_stage = [n_conv_per_stage] * n_stages
-
-        ndim = convert_conv_op_to_dim(conv_op)
-
-        if isinstance(strides, int):
-            strides = [[strides] * ndim] * n_stages
-
-        if isinstance(kernel_sizes, int):
-            kernel_sizes = [[kernel_sizes] * ndim] * n_stages
-
-        if isinstance(channels, int):
-            scale = np.round(np.exp(np.log(strides).mean(axis=1))).astype(int)
-            channels = list(scale.cumprod() * channels)
-
-        self.stem = conv_op(input_channels, channels[0], kernel_size=1)
-        self.enc_blocks = []
-        self.dec_blocks = []
-        self.out_blocks: List[nn.Module] = []
-        self.down_blocks = []
-        self.up_blocks = []
-
-        for idx, (channel, stride, kernel_size) in enumerate(zip(channels, strides[1:], kernel_sizes)):
-            self.enc_blocks.append(nn.Sequential(
-                *[
-                    MedNeXtBlock(
-                        conv_op=conv_op,
-                        input_channels=channel,
-                        out_channels=channel,
-                        expansion_ratio=expansion_ratio[idx],
-                        kernel_size=kernel_size,
-                        do_res=do_res,
-                        norm_type=norm_type,
-                        grn=grn,
-                    )
-                    for _ in range(n_conv_per_stage[idx])
-                ]
-            ))
-            self.down_blocks.append(MedNeXtDownBlock(
-                conv_op=conv_op,
-                input_channels=channel,
-                out_channels=stride[0] * channel,
-                expansion_ratio=expansion_ratio[idx + 1],
-                kernel_size=kernel_size,
-                do_res=do_res_up_down,
-                norm_type=norm_type,
-            ))
-            up_stage_idx = 2 * n_stages - idx
-            self.up_blocks.append(MedNeXtUpBlock(
-                conv_op,
-                input_channels=stride[0] * channel,
-                out_channels=channel,
-                expansion_ratio=expansion_ratio[up_stage_idx],
-                kernel_size=kernel_size,
-                do_res=do_res_up_down,
-                norm_type=norm_type,
-                grn=grn,
-            ))
-            self.dec_blocks.append(nn.Sequential(
-                *[
-                    MedNeXtBlock(
-                        conv_op,
-                        input_channels=channel,
-                        out_channels=channel,
-                        expansion_ratio=expansion_ratio[up_stage_idx],
-                        kernel_size=kernel_size,
-                        do_res=do_res,
-                        norm_type=norm_type,
-                        grn=grn,
-                    )
-                    for _ in range(n_conv_per_stage[up_stage_idx])
-                ]
-            ))
-        self.bottleneck = nn.Sequential(
-            *[
-                MedNeXtBlock(
-                    conv_op=conv_op,
-                    input_channels=channels[-1],
-                    out_channels=channels[-1],
-                    expansion_ratio=expansion_ratio[n_stages],
-                    kernel_size=kernel_sizes[-1],
-                    do_res=do_res,
-                    norm_type=norm_type,
-                    grn=grn,
-                )
-                for _ in range(n_conv_per_stage[n_stages])
-            ]
-        )
-
-
-        # Used to fix PyTorch checkpointing bug
-        self.dummy_tensor = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
-
-        if deep_supervision:
-            self.out_blocks = [*(OutBlock(conv_op, channel, num_classes) for channel in channels),
-                               OutBlock(conv_op, in_channels=channels[-1] * strides[-1][0], n_classes=num_classes)]
-        else:
-            self.out_blocks = [OutBlock(conv_op, channels[0], num_classes)]
-
-        self.block_counts = n_conv_per_stage
-
-    def iterative_checkpoint(self, sequential_block: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
-        """
-        This simply forwards x through each block of the sequential_block while
-        using gradient_checkpointing. This implementation is designed to bypass
-        the following issue in PyTorch's gradient checkpointing:
-        https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/9
-        """
-        for idx in sequential_block:
-            x = checkpoint(idx, x, self.dummy_tensor)
-        return x
-
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor] | torch.Tensor:  # type: ignore
+    def forward(self, x):
         x = self.stem(x)
-        if self.outside_block_checkpointing:
-            encoding_result = []
-            for idx in range(self.n_stages):
-                encoding_result.append(self.iterative_checkpoint(self.enc_blocks[idx], x))
-                x = checkpoint(self.down_blocks[idx], encoding_result[idx], self.dummy_tensor)
+        skips = []
+        for i, stage in enumerate(self.stages):
+            if i:
+                x = run_block(self.down_blocks[i - 1], x, self.checkpointing)
+            for block in stage:
+                x = run_block(block, x, self.checkpointing)
+            skips.append(x)
+        return skips
 
-            x = self.iterative_checkpoint(self.bottleneck, x)
-            if self.deep_supervision:
-                out = [checkpoint(self.out_blocks[self.n_stages], x, self.dummy_tensor)]
-                for idx in range(self.n_stages - 1, -1, -1):
-                    x = checkpoint(self.up_blocks[idx], x, self.dummy_tensor)
-                    x = encoding_result[idx] + x
-                    x = self.iterative_checkpoint(self.dec_blocks[idx], x)
-                    out.append(checkpoint(self.out_blocks[idx], x, self.dummy_tensor))
-                return list(reversed(out))
-            else:
-                for idx in range(self.n_stages - 1, -1, -1):
-                    x = checkpoint(self.up_blocks[idx], x, self.dummy_tensor)
-                    x = encoding_result[idx] + x
-                    x = self.iterative_checkpoint(self.dec_blocks[idx], x)
-                return checkpoint(self.out_blocks[0], x, self.dummy_tensor)
-        else:
-            encoding_result = []
-            for idx in range(self.n_stages):
-                x = self.enc_blocks[idx](x)
-                encoding_result.append(x)
-                x = self.down_blocks[idx](x)
 
-            x = self.bottleneck(x)
-            if self.deep_supervision:
-                out: List[Tensor] = [self.out_blocks[self.n_stages](x)]
-                for idx in range(self.n_stages - 1, -1, -1):
-                    x = self.up_blocks[idx](x)
-                    x = encoding_result[idx] + x
-                    encoding_result[idx] = None
-                    torch.cuda.empty_cache()
-                    x = self.dec_blocks[idx](x)
-                    out.append(self.out_blocks[idx](x))
-                return list(reversed(out))
-            else:
-                for idx in range(self.n_stages - 1, -1, -1):
-                    x = self.up_blocks[idx](x)
-                    x = encoding_result[idx] + x
-                    encoding_result[idx] = None
-                    torch.cuda.empty_cache()
-                    x = self.dec_blocks[idx](x)
-                return self.out_blocks[0](x)
+class MedNeXtDecoder(nn.Module):
+    def __init__(self, features, conv_op, kernels, strides, counts, expansions,
+                 num_classes, deep_supervision, do_res, do_res_up_down, norm_type,
+                 grn, drop_path_rate, checkpointing):
+        super().__init__()
+        self.deep_supervision = deep_supervision
+        self.checkpointing = checkpointing
+        # Decoder lists are ordered by increasing resolution (bottleneck to full resolution).
+        self.up_blocks = nn.ModuleList()
+        self.stages = nn.ModuleList()
+        self.seg_layers = nn.ModuleList()
+        for j, i in enumerate(range(len(features) - 2, -1, -1)):
+            self.up_blocks.append(MedNeXtUpBlock(
+                conv_op, features[i + 1], features[i], expansions[j], kernels[i],
+                stride=strides[i + 1], do_res=do_res_up_down, norm_type=norm_type, grn=grn))
+            self.stages.append(nn.Sequential(*[
+                MedNeXtBlock(conv_op, features[i], features[i], expansions[j], kernels[i],
+                             do_res=do_res, norm_type=norm_type, grn=grn,
+                             drop_path_rate=drop_path_rate)
+                for _ in range(counts[j])]))
+            # Always register heads so inference and training state dictionaries agree.
+            self.seg_layers.append(OutBlock(conv_op, features[i], num_classes))
+
+    def forward(self, skips):
+        x = skips[-1]
+        outputs = []
+        for j, (up, stage, head) in enumerate(zip(self.up_blocks, self.stages, self.seg_layers)):
+            x = run_block(up, x, self.checkpointing)
+            skip = skips[-2 - j]
+            # Odd input sizes are allowed; planned patches are stride-divisible.
+            x = x[(slice(None), slice(None)) + tuple(slice(0, s) for s in skip.shape[2:])]
+            x = x + skip
+            for block in stage:
+                x = run_block(block, x, self.checkpointing)
+            if self.deep_supervision or j == len(self.stages) - 1:
+                outputs.append(head(x))
+        return outputs[::-1] if self.deep_supervision else outputs[-1]
+
+
+class MedNeXt(AbstractDynamicNetworkArchitectures):
+    """n_stages includes the bottleneck; strides[0] must be identity.
+
+    Encoder counts/expansions are ordered full resolution to bottleneck;
+    decoder counts/expansions are ordered bottleneck to full resolution.
+    """
+    def __init__(self, input_channels, n_stages, features_per_stage, conv_op,
+                 kernel_sizes, strides, num_classes, n_conv_per_stage=2,
+                 n_conv_per_stage_decoder=2, expansion_ratio=4,
+                 expansion_ratio_decoder=None, deep_supervision=False,
+                 do_res=True, do_res_up_down=True, norm_type='group', grn=True,
+                 drop_path_rate=0., outside_block_checkpointing=False):
+        super().__init__()
+        if not isinstance(n_stages, int) or n_stages < 2:
+            raise ValueError('MedNeXt needs at least two resolution stages')
+        if input_channels < 1 or num_classes < 1:
+            raise ValueError('input_channels and num_classes must be positive')
+        ndim = convert_conv_op_to_dim(conv_op)
+        if ndim != 3:
+            raise ValueError('This MedNeXt architecture supports 3D only')
+        if isinstance(features_per_stage, int):
+            features_per_stage = [features_per_stage * 2 ** i for i in range(n_stages)]
+        features = stage_values(features_per_stage, n_stages, 'features_per_stage')
+        kernels = spatial_stages(kernel_sizes, n_stages, ndim, 'kernel_sizes')
+        strides = spatial_stages(strides, n_stages, ndim, 'strides')
+        if strides[0] != (1,) * ndim or any(s not in (1, 2) for stage in strides for s in stage):
+            raise ValueError('strides[0] must be identity; subsequent strides must use 1 or 2')
+        if any(stage == (1,) * ndim for stage in strides[1:]):
+            raise ValueError('Each subsequent stage must downsample at least one axis')
+        counts = stage_values(n_conv_per_stage, n_stages, 'n_conv_per_stage')
+        dec_counts = stage_values(n_conv_per_stage_decoder, n_stages - 1, 'n_conv_per_stage_decoder')
+        expansions = stage_values(expansion_ratio, n_stages, 'expansion_ratio')
+        dec_expansions = (expansions[:-1][::-1] if expansion_ratio_decoder is None else
+                          stage_values(expansion_ratio_decoder, n_stages - 1, 'expansion_ratio_decoder'))
+        self.n_stages = n_stages
+        self.num_classes = num_classes
+        self.encoder = MedNeXtEncoder(
+            input_channels, features, conv_op, kernels, strides, counts, expansions,
+            do_res, do_res_up_down, norm_type, grn, drop_path_rate, outside_block_checkpointing)
+        self.decoder = MedNeXtDecoder(
+            features, conv_op, kernels, strides, dec_counts, dec_expansions,
+            num_classes, deep_supervision, do_res, do_res_up_down, norm_type, grn,
+            drop_path_rate, outside_block_checkpointing)
+        self.key_to_encoder = 'encoder.stages'
+        self.key_to_stem = 'encoder.stem'
+        self.keys_to_in_proj = ('encoder.stem',)
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+    def compute_conv_feature_map_size(self, input_size):
+        """Convolution output elements per sample, including expansion and skip projections.
+
+        This is a topology metric, not a measured training memory requirement.
+        Decoder heads are included regardless of the inference supervision toggle.
+        """
+        if len(input_size) != 3 or any(s < 1 for s in input_size):
+            raise ValueError('input_size must be three positive spatial dimensions')
+        size = tuple(int(s) for s in input_size)
+        sizes = []
+        total = prod(size) * self.encoder.output_channels[0]
+        for i, stage in enumerate(self.encoder.stages):
+            if i:
+                down = self.encoder.down_blocks[i - 1]
+                size = tuple((s + st - 1) // st for s, st in zip(size, down.stride))
+                total += down.compute_conv_feature_map_size(size)
+            sizes.append(size)
+            total += sum(block.compute_conv_feature_map_size(size) for block in stage)
+        for j, (up, stage) in enumerate(zip(self.decoder.up_blocks, self.decoder.stages)):
+            up_size = tuple(s * st for s, st in zip(size, up.stride))
+            total += up.compute_conv_feature_map_size(up_size)
+            size = sizes[-2 - j]
+            total += sum(block.compute_conv_feature_map_size(size) for block in stage)
+            total += prod(size) * self.num_classes
+        return int(total)
